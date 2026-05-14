@@ -445,6 +445,8 @@ select:focus{border-color:var(--blue)}
         <div id="map-controls">
           <button class="btn icon-only" onclick="mindMap.resetLayout()" title="Reset layout">⟳</button>
           <button class="btn icon-only" onclick="mindMap.toggleLabels()" title="Toggle labels">T</button>
+          <button class="btn icon-only" onclick="exportMapPNG()" title="Export mind map as PNG">🖼</button>
+          <button class="btn icon-only" onclick="exportTracePNG()" title="Export trace as PNG" id="trace-png-btn" style="display:none">🖼</button>
         </div>
         <div id="map-legend">
           <div class="leg-item"><div class="leg-dot" style="background:var(--green)"></div> Active</div>
@@ -516,7 +518,8 @@ select:focus{border-color:var(--blue)}
   <!-- VIEW: INVESTIGATE / WALLET TRACE -->
   <div id="v-trace">
     <div id="trace-bar">
-      <input type="text" id="trace-addr" placeholder="Paste any wallet address to trace its funding chain back to origin…" onkeydown="if(event.key==='Enter')startTrace()"/>
+      <input type="text" id="trace-addr" placeholder="Paste any wallet address to trace its funding chain back to origin…" onkeydown="if(event.key==='Enter')startTrace()" list="trace-history-list"/>
+      <datalist id="trace-history-list"></datalist>
       <select id="trace-depth" style="width:auto;margin:0;padding:5px 8px;font-size:10px">
         <option value="3">3 hops</option>
         <option value="5" selected>5 hops</option>
@@ -661,6 +664,8 @@ const MAX_PARALLEL   = 3;
 const MAX_RETRIES    = 3;
 const TOAST_TTL      = 5500;
 const TOAST_DEDUP_TTL = 7000;
+const TRACE_MAX_SAVED  = 10;   // max past traces to keep for comparison
+const TRACE_MAX_FUNDERS= 3;    // max branches per node during trace   // max past traces to keep for comparison
 const TIME_REFRESH   = 30_000;
 const WPLS           = '0xA1077a294dDE1B09bB078844df40758a5D0f9a27'.toLowerCase();
 
@@ -1538,7 +1543,7 @@ function buildCard(tx) {
   return el;
 }
 
-function refreshTimestamps() { document.querySelectorAll('[data-ts]').forEach(el=>{ const t=el.querySelector('.txc-time'); if(t)t.textContent=timeAgo(el.dataset.ts); }); }
+function refreshTimestamps() { const cards=document.querySelectorAll('[data-ts]'); if(!cards.length)return; cards.forEach(el=>{ const t=el.querySelector('.txc-time'); if(t)t.textContent=timeAgo(el.dataset.ts); }); }
 
 // ═══════════════════════════════════════════════════════
 //  RENDER: STATS  
@@ -1639,6 +1644,10 @@ function renderSummary() {
 //  RENDER: DASHBOARD PANEL
 // ═══════════════════════════════════════════════════════
 async function renderDashPanel(w) {
+  // Skip full rebuild if nothing changed
+  const key = w ? String(w.id)+'|'+w.balance+'|'+(w.txCount||0) : 'null';
+  if (renderDashPanel._lastKey === key) return;
+  renderDashPanel._lastKey = key;
   const panel=document.getElementById('dash-detail');
   const actions=document.getElementById('dpanel-actions');
   document.querySelector('.dpanel-title').textContent=w?'Wallet Detail':'Network Overview';
@@ -2035,7 +2044,7 @@ function rrect(c, x, y, w, h, r) {
 async function tGetInfo(address) {
   const [bR,tR] = await Promise.allSettled([
     apiFetch({module:'account',action:'balance',address,tag:'latest'}),
-    apiFetch({module:'account',action:'txlist',address,startblock:0,endblock:'99999999',page:1,offset:100,sort:'desc'}),
+    apiFetch({module:'account',action:'txlist',address,startblock:0,endblock:'99999999',page:1,offset:25,sort:'desc'}),
   ]);
   const balance  = bR.value?.status==='1' ? bR.value.result : null;
   const txs      = (tR.value?.status==='1' && Array.isArray(tR.value.result)) ? tR.value.result : [];
@@ -2066,7 +2075,7 @@ async function tFindFunders(address) {
     if (!f || f===address.toLowerCase() || seen.has(f)) continue;
     seen.add(f);
     funders.push({address:tx.from,amount:tx.value||'0',tokenSym:tx.tokenSymbol||null,ts:tx.timeStamp,hash:tx.hash});
-    if (funders.length>=3) break; // cap at 3 paths per node
+    if (funders.length>=TRACE_MAX_FUNDERS) break;
   }
   return funders;
 }
@@ -2142,6 +2151,8 @@ function detectSharedFunders(graph) {
 
 // ── Progress UI ──
 function setTP(txt, pct, count) {
+  TR._traceStatus = txt;
+  TR._traceCount  = count;
   const foot = document.getElementById('trace-foot');
   foot.style.display='flex';
   document.getElementById('trace-foot-txt').textContent=txt;
@@ -2163,7 +2174,9 @@ async function runTrace(rootAddress, maxDepth) {
       if (parentId!==null) graph.edges.push({funderId:visited.get(aLow),fundedId:parentId,ref:true});
       continue;
     }
-    setTP(`Analyzing ${shortAddr(address)} (depth ${depth})…`, Math.min(95, (graph.nodes.length/(maxDepth*2))*100), `${graph.nodes.length} nodes found`);
+    const hopPct = maxDepth>0 ? Math.min(92, (depth/maxDepth)*85 + (graph.nodes.length/(maxDepth*3))*10) : 50;
+    const hopStr = `Hop ${depth}/${maxDepth} — ${shortAddr(address)}`;
+    setTP(hopStr, hopPct, `${graph.nodes.length} nodes · ${queue.length} queued`);
     
     let info = {balance:null,txCountN:0,txCount:'0',deployed:0,firstTs:null};
     try { info=await tGetInfo(address); calls+=2; } catch(e){}
@@ -2177,14 +2190,16 @@ async function runTrace(rootAddress, maxDepth) {
     
     if (depth<maxDepth && !tIsTerminal(entity,info) && !TR.cancelled) {
       try {
+        try {
         const funders = await tFindFunders(address); calls+=2;
         for (const f of funders) {
           if (!visited.has(f.address.toLowerCase()))
             queue.push({address:f.address,depth:depth+1,parentId:nid,fundingTx:f});
         }
+      } catch(_fe) { /* funders fetch failed — stop branch silently */ }
       } catch(e){}
     }
-    renderTrace();
+    if (!TR._rafPending) { TR._rafPending=true; requestAnimationFrame(()=>{ TR._rafPending=false; renderTrace(); }); }
   }
   return graph;
 }
@@ -2237,8 +2252,9 @@ function traceInitCanvas() {
   },{passive:false});
   cv.addEventListener('mousedown',e=>{TR.drag.on=true;TR.drag.lx=e.clientX;TR.drag.ly=e.clientY;cv.classList.add('grabbing');});
   cv.addEventListener('mousemove',e=>{
-    if(TR.drag.on){TR.camera.x+=e.clientX-TR.drag.lx;TR.camera.y+=e.clientY-TR.drag.ly;TR.drag.lx=e.clientX;TR.drag.ly=e.clientY;renderTrace();}
-    else { const nd=hitTestTrace(e); TR.hovered=nd?nd.id:null; showTCTooltip(nd,e); renderTrace(); }
+    if(TR.drag.on){TR.camera.x+=e.clientX-TR.drag.lx;TR.camera.y+=e.clientY-TR.drag.ly;TR.drag.lx=e.clientX;TR.drag.ly=e.clientY;}
+    else { const nd=hitTestTrace(e); TR.hovered=nd?nd.id:null; showTCTooltip(nd,e); }
+    if(!TR._movePending){TR._movePending=true;requestAnimationFrame(()=>{TR._movePending=false;renderTrace();});}
   });
   cv.addEventListener('mouseup',()=>{TR.drag.on=false;cv.classList.remove('grabbing');});
   cv.addEventListener('mouseleave',()=>{TR.drag.on=false;cv.classList.remove('grabbing');document.getElementById('tc-tooltip').style.display='none';TR.hovered=null;});
@@ -2250,7 +2266,7 @@ function traceInitCanvas() {
   });
   // Touch
   cv.addEventListener('touchstart',e=>{if(e.touches.length){TR.drag.on=true;TR.drag.lx=e.touches[0].clientX;TR.drag.ly=e.touches[0].clientY;}},{passive:true});
-  cv.addEventListener('touchmove',e=>{if(TR.drag.on&&e.touches.length){TR.camera.x+=e.touches[0].clientX-TR.drag.lx;TR.camera.y+=e.touches[0].clientY-TR.drag.ly;TR.drag.lx=e.touches[0].clientX;TR.drag.ly=e.touches[0].clientY;renderTrace();}},{passive:true});
+  cv.addEventListener('touchmove',e=>{if(TR.drag.on&&e.touches.length){TR.camera.x+=e.touches[0].clientX-TR.drag.lx;TR.camera.y+=e.touches[0].clientY-TR.drag.ly;TR.drag.lx=e.touches[0].clientX;TR.drag.ly=e.touches[0].clientY;if(!TR._movePending){TR._movePending=true;requestAnimationFrame(()=>{TR._movePending=false;renderTrace();});}}},{passive:true});
   cv.addEventListener('touchend',()=>{TR.drag.on=false;});
 }
 
@@ -2294,22 +2310,42 @@ function renderTrace() {
   c.fillStyle='rgba(26,53,80,.3)';
   const gs=30; for(let gx=0;gx<W;gx+=gs) for(let gy=0;gy<H;gy+=gs){c.beginPath();c.arc(gx,gy,.7,0,Math.PI*2);c.fill();}
   
-  if (!TR.graph?.nodes?.length) return;
+  if (!TR.graph?.nodes?.length) {
+    if (TR.running) {
+      // Draw loading overlay on canvas while tracing
+      c.fillStyle='rgba(0,170,255,.08)';
+      rrect(c,W/2-140,H/2-36,280,72,8); c.fill();
+      c.strokeStyle='rgba(0,170,255,.3)'; c.lineWidth=1;
+      rrect(c,W/2-140,H/2-36,280,72,8); c.stroke();
+      c.fillStyle='#00aaff'; c.font='bold 11px JetBrains Mono,monospace';
+      c.textAlign='center'; c.textBaseline='middle';
+      c.fillText(TR._traceStatus||'Initializing trace…', W/2, H/2-10);
+      c.fillStyle='rgba(0,170,255,.5)'; c.font='9px JetBrains Mono,monospace';
+      c.fillText(TR._traceCount||'', W/2, H/2+10);
+      // Animated spinner arc
+      const t=Date.now()/600;
+      c.strokeStyle='rgba(0,170,255,.7)'; c.lineWidth=2.5;
+      c.beginPath(); c.arc(W/2,H/2+30,10,t,t+Math.PI*1.3); c.stroke();
+      if(!TR._rafSpinner) TR._rafSpinner=requestAnimationFrame(()=>{TR._rafSpinner=null;renderTrace();});
+    }
+    return;
+  }
   c.save();
   c.translate(TR.camera.x, TR.camera.y);
   c.scale(TR.camera.scale, TR.camera.scale);
   
-  // Edges
+  // Edges — use Map for O(1) lookups instead of repeated .find()
+  const _nm = new Map(TR.graph.nodes.map(n=>[n.id,n]));
   TR.graph.edges.forEach(e=>{
-    const fn=TR.graph.nodes.find(n=>n.id===e.funderId);
-    const tn=TR.graph.nodes.find(n=>n.id===e.fundedId);
+    const fn=_nm.get(e.funderId);
+    const tn=_nm.get(e.fundedId);
     if(!fn||!tn||fn.lx==null||tn.lx==null) return;
     drawTEdge(c,fn,tn,e.ref);
   });
   
   // Nodes (draw selected last so it's on top)
   TR.graph.nodes.filter(n=>n.id!==TR.selectedNode?.id).forEach(n=>drawTNode(c,n));
-  if (TR.selectedNode) { const sn=TR.graph.nodes.find(n=>n.id===TR.selectedNode?.id); if(sn)drawTNode(c,sn); }
+  if (TR.selectedNode) { const sn=_nm.get(TR.selectedNode.id); if(sn)drawTNode(c,sn); }
   
   c.restore();
 }
@@ -2438,6 +2474,7 @@ async function startTrace() {
     
     // Show controls
     document.getElementById('trace-export-btn').style.display='';
+    document.getElementById('trace-png-btn').style.display='';
     document.getElementById('trace-save-btn').style.display='';
     if (SAVED_TRACES.length>0) document.getElementById('trace-compare-btn').style.display='';
     
@@ -2507,45 +2544,82 @@ function selectTraceNode(nodeId) {
   if (!node) return;
   TR.selectedNode = node;
   renderTrace();
-  
-  const ent = node.entity||{};
-  const st = ENT_STYLE[ent.type]||ENT_STYLE.unknown;
-  const isRoot = node.id===TR.graph.rootId;
-  const usd = plsToUsd(node.info?.balance);
-  
-  // Find which wallets this one funded / was funded by
-  const fundedBy = TR.graph.edges.filter(e=>e.fundedId===nodeId&&!e.ref).map(e=>TR.graph.nodes.find(n=>n.id===e.funderId)).filter(Boolean);
-  const funded   = TR.graph.edges.filter(e=>e.funderId===nodeId&&!e.ref).map(e=>TR.graph.nodes.find(n=>n.id===e.fundedId)).filter(Boolean);
-  
-  document.getElementById('tpanel-actions').innerHTML=`
-    <button class="btn" style="padding:2px 7px;font-size:9px" onclick="copyAddr('${node.address}',event)">⎘ Copy</button>
-    <button class="btn" style="padding:2px 7px;font-size:9px" onclick="window.open('${EXPLORER}/address/${node.address}','_blank')">↗ Explorer</button>
-    ${S.wallets.find(w=>w.address.toLowerCase()===node.address.toLowerCase())?'':'<button class="btn green" style="padding:2px 7px;font-size:9px" onclick="addTracedWallet(''+node.address+'')">+ Track</button>'}`;
-  
-  const riskClass = (TR.risk?.score||0)>=70?'risk-hi':(TR.risk?.score||0)>=35?'risk-md':'risk-lo';
-  document.getElementById('tpanel-body').innerHTML=`
-    <div class="ent-tag et-${isRoot?'root':ent.type}" style="margin-bottom:8px">${ent.icon||'?'} ${esc(ent.name||'Unknown')}</div>
-    ${isRoot?'<div class="ent-tag et-root" style="margin-left:4px">🎯 TARGET</div>':''}
-    <div style="font-size:9px;color:var(--text3);word-break:break-all;line-height:1.6;margin-bottom:6px">${node.address}</div>
+
+  const ent      = node.entity||{};
+  const isRoot   = node.id===TR.graph.rootId;
+  const usd      = plsToUsd(node.info?.balance);
+  // FIX: riskClass was undefined — define it here
+  const riskClass= (TR.risk?.score||0)>=70?'risk-hi':(TR.risk?.score||0)>=35?'risk-md':'risk-lo';
+
+  const fundedBy = TR.graph.edges.filter(e=>e.fundedId===nodeId&&!e.ref)
+    .map(e=>TR.graph.nodes.find(n=>n.id===e.funderId)).filter(Boolean);
+  const funded   = TR.graph.edges.filter(e=>e.funderId===nodeId&&!e.ref)
+    .map(e=>TR.graph.nodes.find(n=>n.id===e.fundedId)).filter(Boolean);
+
+  // FIX: Build buttons via DOM — avoids quote-nesting in onclick attributes
+  const actEl = document.getElementById('tpanel-actions');
+  actEl.innerHTML = '';
+  const mkBtn = (txt, cls, fn) => {
+    const b = document.createElement('button');
+    b.className = 'btn' + (cls ? ' '+cls : '');
+    b.style.cssText = 'padding:2px 7px;font-size:9px';
+    b.textContent = txt;
+    b.addEventListener('click', fn);
+    actEl.appendChild(b);
+  };
+  mkBtn('⎘ Copy',    '',      e => { e.stopPropagation(); navigator.clipboard.writeText(node.address); toast('transfer','⎘ Copied',shortAddr(node.address),''); });
+  mkBtn('↗ Explorer','',      () => window.open(EXPLORER+'/address/'+node.address, '_blank'));
+  mkBtn('🔍 Re-trace','',     () => { document.getElementById('trace-addr').value=node.address; startTrace(); });
+  if (!S.wallets.find(w=>w.address.toLowerCase()===node.address.toLowerCase()))
+    mkBtn('+ Track', 'green', () => addTracedWallet(node.address));
+
+  // Chain navigation row builder
+  const chainRow = n2 => `
+    <div class="chain-step" onclick="selectTraceNode(${n2.id})">
+      <div class="cstep-depth" style="color:${(ENT_STYLE[n2.entity?.type]||ENT_STYLE.unknown).color}">${n2.depth}</div>
+      <div class="cstep-icon">${n2.entity?.icon||'?'}</div>
+      <div class="cstep-body">
+        <div class="cstep-name">${esc(n2.entity?.name||'Unknown')}</div>
+        <div class="cstep-addr">${shortAddr(n2.address)}</div>
+      </div>
+    </div>`;
+
+  const riskSection = (TR.risk && isRoot) ? `
+    <div class="sub-title" style="margin-top:8px">Risk Assessment</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+      <span style="font-size:10px;color:var(--text2)">Risk Score</span>
+      <span style="font-family:var(--font-hud);font-size:15px;color:${
+        TR.risk.score>=70?'var(--red)':TR.risk.score>=35?'var(--orange)':'var(--green)'
+      }">${TR.risk.score}<span style="font-size:9px;color:var(--text3)">/100</span></span>
+    </div>
+    <div class="risk-bar"><div class="risk-bar-f ${riskClass}" style="width:${TR.risk.score}%"></div></div>
+    ${TR.risk.factors.length
+      ? TR.risk.factors.map(f=>`<div class="risk-factor"><div class="rfd" style="background:${f.c}"></div><div>${f.txt}</div></div>`).join('')
+      : '<div style="font-size:10px;color:var(--green)">No significant risk factors detected</div>'
+    }
+    <button class="btn" style="width:100%;justify-content:center;font-size:9px;margin-top:8px" onclick="copyChainSummary()">⎘ Copy Chain Summary</button>
+    ` : '';
+
+  document.getElementById('tpanel-body').innerHTML = `
+    <div class="ent-tag et-${isRoot?'root':ent.type}" style="margin-bottom:6px">${ent.icon||'?'} ${esc(ent.name||'Unknown')}${isRoot?' <span style="opacity:.6;font-size:8px">— TARGET</span>':''}
+    </div>
+    <div style="font-size:9px;color:var(--text3);word-break:break-all;line-height:1.6;margin-bottom:5px">${node.address}</div>
     <div class="wd-bal">
       <div class="big" style="font-size:16px">${node.info?.balance!=null?fmtPls(node.info.balance):'—'}</div>
       ${usd?`<div class="usd">${fmtUsd(usd)}</div>`:''}
-      <div class="sub">PLS Balance · ${node.info?.txCount||'?'} transactions</div>
+      <div class="sub">PLS · ${node.info?.txCount||'?'} txns</div>
     </div>
-    ${node.info?.deployed?`<div style="padding:5px 0;font-size:10px;color:var(--orange)">📜 Deployed ${node.info.deployed} smart contract(s)</div>`:''}
-    ${node.info?.firstTs?`<div style="font-size:9px;color:var(--text3);margin-bottom:6px">First seen: ${new Date(parseInt(node.info.firstTs)*1000).toLocaleDateString()}</div>`:''}
+    ${node.info?.deployed?`<div style="padding:4px 0;font-size:10px;color:var(--orange)">📜 ${node.info.deployed} contract(s) deployed</div>`:''}
+    ${node.info?.firstTs?`<div style="font-size:9px;color:var(--text3);margin-bottom:5px">First seen: ${new Date(parseInt(node.info.firstTs)*1000).toLocaleDateString()}</div>`:''}
     ${node.depth>0?`<div class="sub-title">Chain Position</div><div class="info-row"><span class="ik">Hops from target</span><span class="iv">${node.depth}</span></div>`:''}
-    ${node.fundingTx?`<div class="info-row"><span class="ik">Funding amount</span><span class="iv" style="color:var(--blue)">${node.fundingTx.tokenSym?fmtTok(node.fundingTx.amount,18,node.fundingTx.tokenSym):fmtPls(node.fundingTx.amount)}</span></div><div class="info-row"><span class="ik">Funded on</span><span class="iv">${new Date(parseInt(node.fundingTx.ts||0)*1000).toLocaleDateString()}</span></div>`:''}
-    ${fundedBy.length?`<div class="sub-title">Funded By (${fundedBy.length})</div>${fundedBy.map(fn=>`<div class="chain-step" onclick="selectTraceNode(${fn.id})"><div class="cstep-depth">${fn.depth}</div><div class="cstep-icon">${fn.entity?.icon||'?'}</div><div class="cstep-body"><div class="cstep-name">${esc(fn.entity?.name||'Unknown')}</div><div class="cstep-addr">${shortAddr(fn.address)}</div></div></div>`).join('')}`:''}
-    ${funded.length?`<div class="sub-title">Funded These (${funded.length})</div>${funded.map(tn=>`<div class="chain-step" onclick="selectTraceNode(${tn.id})"><div class="cstep-depth">${tn.depth}</div><div class="cstep-icon">${tn.entity?.icon||'?'}</div><div class="cstep-body"><div class="cstep-name">${esc(tn.entity?.name||'Unknown')}</div><div class="cstep-addr">${shortAddr(tn.address)}</div></div></div>`).join('')}`:''}
-    ${TR.risk&&isRoot?`
-    <div class="sub-title" style="margin-top:8px">Risk Assessment</div>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px">
-      <span style="font-size:10px;color:var(--text2)">Risk Score</span>
-      <span style="font-family:var(--font-hud);font-size:15px;color:${TR.risk.score>=70?'var(--red)':TR.risk.score>=35?'var(--orange)':'var(--green)'}">${TR.risk.score}<span style="font-size:9px;color:var(--text3)">/100</span></span>
-    </div>
-    <div class="risk-bar"><div class="risk-bar-f ${riskClass}" style="width:${TR.risk.score}%"></div></div>
-    ${TR.risk.factors.map(f=>`<div class="risk-factor"><div class="rfd" style="background:${f.c}"></div><div>${f.txt}</div></div>`).join('')||'<div style="font-size:10px;color:var(--green)">No significant risk factors detected</div>'}`:''}`;
+    ${node.fundingTx?`
+      <div class="info-row"><span class="ik">Funded with</span>
+        <span class="iv" style="color:var(--blue)">${node.fundingTx.tokenSym?fmtTok(node.fundingTx.amount,18,node.fundingTx.tokenSym):fmtPls(node.fundingTx.amount)}</span></div>
+      <div class="info-row"><span class="ik">Date</span>
+        <span class="iv">${new Date(parseInt(node.fundingTx.ts||0)*1000).toLocaleDateString()}</span></div>`:''}
+    ${fundedBy.length?`<div class="sub-title">Funded By (${fundedBy.length})</div>${fundedBy.map(chainRow).join('')}` :''}
+    ${funded.length?`<div class="sub-title">Funded These (${funded.length})</div>${funded.map(chainRow).join('')}` :''}
+    ${riskSection}`;
 }
 
 function selectTraceNodeByAddr(addr) {
@@ -2573,8 +2647,9 @@ function saveTrace() {
   // Check for existing
   const idx=SAVED_TRACES.findIndex(t=>t.address.toLowerCase()===root.address.toLowerCase());
   if (idx>=0) SAVED_TRACES[idx]={address:root.address,label,graph:TR.graph,ts:Date.now()};
-  else SAVED_TRACES.push({address:root.address,label,graph:TR.graph,ts:Date.now()});
+  else { SAVED_TRACES.push({address:root.address,label,graph:TR.graph,ts:Date.now()}); if(SAVED_TRACES.length>TRACE_MAX_SAVED) SAVED_TRACES.shift(); }
   toast('transfer',`💾 Trace saved`,`"${label}" — compare future traces against this`,'');
+  updateTraceHistory();
   document.getElementById('trace-compare-btn').style.display='';
   document.getElementById('trace-save-btn').textContent='💾 Saved ✓';
 }
@@ -2641,18 +2716,56 @@ function exportTraceReport() {
 }
 
 // ── Chain summary (visible below alerts for quick orientation) ──
-function buildChainSummary(graph) {
-  // Order nodes from root outward
-  const ordered=[];
-  const visit=(id,depth)=>{
-    const nd=graph.nodes.find(n=>n.id===id); if(!nd)return;
-    ordered.push(nd);
-    graph.edges.filter(e=>e.fundedId===id&&!e.ref).forEach(e=>visit(e.funderId,depth+1));
-  };
-  visit(graph.rootId,0);
-  return ordered;
-}
+
 // ═══════════════════════════════════════════════════════
+
+
+// ── PNG exports ──
+function exportMapPNG() {
+  const cv = document.getElementById('mindmap');
+  if (!cv) return;
+  const a = document.createElement('a');
+  a.download = 'pulsetrack_mindmap_' + Date.now() + '.png';
+  a.href = cv.toDataURL('image/png');
+  a.click();
+  toast('transfer','🖼 Mind map exported','PNG saved','');
+}
+
+function exportTracePNG() {
+  const cv = document.getElementById('trace-canvas');
+  if (!cv||!TR.graph) return;
+  const a = document.createElement('a');
+  a.download = 'pulsetrack_trace_' + Date.now() + '.png';
+  a.href = cv.toDataURL('image/png');
+  a.click();
+  toast('transfer','🖼 Trace exported','PNG saved','');
+}
+
+// ── Update trace history datalist ──
+function updateTraceHistory() {
+  const dl = document.getElementById('trace-history-list');
+  if (!dl) return;
+  dl.innerHTML = SAVED_TRACES.map(t =>
+    `<option value="${t.address}" label="${t.label} — ${new Date(t.ts).toLocaleDateString()}">`
+  ).join('');
+}
+
+// ── Copy chain summary to clipboard ──
+function copyChainSummary() {
+  if (!TR.graph) return;
+  const root = TR.graph.nodes.find(n=>n.id===TR.graph.rootId);
+  const lines = ['WALLET CHAIN SUMMARY', '='.repeat(40)];
+  // Order by depth ascending
+  const ordered = [...TR.graph.nodes].sort((a,b)=>b.depth-a.depth);
+  ordered.forEach(n=>{
+    const indent = '  '.repeat(n.depth>0 ? (Math.max(...TR.graph.nodes.map(x=>x.depth))-n.depth) : 0);
+    const arrow = n.id===TR.graph.rootId ? '▶ TARGET: ' : `${'→'.repeat(n.depth+1)} `;
+    lines.push(indent+arrow+n.address+' ['+((n.entity&&n.entity.name)||'Unknown')+']');
+  });
+  if (TR.risk) lines.push('', `Risk Score: ${TR.risk.score}/100`, ...TR.risk.factors.map(f=>'  • '+f.txt));
+  navigator.clipboard.writeText(lines.join('\n')).then(()=>toast('transfer','⎘ Chain copied','Paste into notes or report',''));
+}
+
 function init() {
   doLoad();
   updateApiStatus();
